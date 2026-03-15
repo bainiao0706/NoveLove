@@ -1,0 +1,16 @@
+#include "Generated.xcconfig"
+
+// === Rust Static Lib Linker Config ===
+// The goal: Force iOS linker to include ALL symbols from our Rust static library
+
+// 1. Disable all stripping
+DEPLOYMENT_POSTPROCESSING = NO
+STRIP_INSTALLED_PRODUCT = NO
+DEAD_CODE_STRIPPING = NO
+COPY_PHASE_STRIP = NO
+
+// 2. Linker flags
+// -force_load: Force load ALL symbols from our specific Rust library
+// -ObjC: Required for Objective-C categories
+// -lc++: Link C++ standard library (for brotli/woff2)
+OTHER_LDFLAGS = $(inherited) -force_load "$(PROJECT_DIR)/libs/libnovella_native.a" -ObjC -lc++

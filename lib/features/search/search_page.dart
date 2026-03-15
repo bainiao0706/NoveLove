@@ -1,0 +1,525 @@
+import 'dart:math' as math;
+
+import 'package:novella/src/widgets/book_cover_image.dart';
+import 'package:flutter/material.dart';
+import 'package:logging/logging.dart';
+import 'package:novella/data/models/book.dart';
+import 'package:novella/data/services/book_service.dart';
+import 'package:novella/features/book/book_detail_page.dart';
+import 'package:novella/core/widgets/m3e_loading_indicator.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:novella/features/settings/settings_page.dart';
+import 'package:novella/src/widgets/book_type_badge.dart';
+import 'package:novella/src/widgets/book_cover_previewer.dart';
+
+class SearchPage extends ConsumerStatefulWidget {
+  const SearchPage({super.key});
+
+  @override
+  ConsumerState<SearchPage> createState() => _SearchPageState();
+}
+
+class _SearchPageState extends ConsumerState<SearchPage> {
+  final _logger = Logger('SearchPage');
+  final _bookService = BookService();
+  final _searchController = TextEditingController();
+  final _focusNode = FocusNode();
+  final _scrollController = ScrollController();
+
+  // 状态
+  List<String> _history = [];
+  final List<Book> _allValidBooks = [];
+  int _currentFrontendPage = 1;
+  int _nextBackendPage = 1;
+  bool _hasReachedEnd = false;
+  bool _loading = false;
+  bool _hasSearched = false;
+  String? _pendingDeleteItem;
+  String _lastKeyword = '';
+  static const int _pageSize = 24;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadHistory();
+    // 自动聚焦搜索框
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _focusNode.requestFocus();
+    });
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    _focusNode.dispose();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadHistory() async {
+    final prefs = await SharedPreferences.getInstance();
+    final history = prefs.getStringList('search_history') ?? [];
+    setState(() {
+      _history = history;
+    });
+  }
+
+  Future<void> _saveHistory() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('search_history', _history);
+  }
+
+  void _addToHistory(String keyword) {
+    if (keyword.isEmpty) return;
+    setState(() {
+      // 若存在则移除，然后添加到头部
+      _history.remove(keyword);
+      _history.insert(0, keyword);
+      // 保留最多20条记录
+      if (_history.length > 20) {
+        _history = _history.sublist(0, 20);
+      }
+    });
+    _saveHistory();
+  }
+
+  void _removeFromHistory(String keyword) {
+    setState(() {
+      _history.remove(keyword);
+      _pendingDeleteItem = null;
+    });
+    _saveHistory();
+  }
+
+  Future<void> _clearHistory() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder:
+          (context) => AlertDialog(
+            title: const Text('清空搜索历史'),
+            content: const Text('确定要清空所有搜索记录吗？'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('取消'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('清空'),
+              ),
+            ],
+          ),
+    );
+
+    if (confirmed == true) {
+      setState(() {
+        _history.clear();
+      });
+      _saveHistory();
+    }
+  }
+
+  void _submitSearch([String? overrideKeyword]) {
+    final keyword = overrideKeyword ?? _searchController.text.trim();
+    if (keyword.isEmpty) return;
+
+    // 收起键盘
+    FocusScope.of(context).unfocus();
+
+    _addToHistory(keyword);
+    _lastKeyword = keyword;
+    if (_searchController.text != keyword) {
+      _searchController.text = keyword;
+    }
+
+    _allValidBooks.clear();
+    _nextBackendPage = 1;
+    _hasReachedEnd = false;
+
+    _fetchPage(1);
+  }
+
+  Future<void> _fetchPage(int page) async {
+    if (_lastKeyword.isEmpty) return;
+
+    setState(() {
+      _loading = true;
+      _hasSearched = true;
+    });
+
+    try {
+      final settings = ref.read(settingsProvider);
+      int targetValidCount = page * _pageSize;
+
+      while (_allValidBooks.length < targetValidCount && !_hasReachedEnd) {
+        final result = await _bookService.searchBooks(
+          _lastKeyword,
+          page: _nextBackendPage,
+          size: _pageSize,
+          ignoreJapanese: settings.ignoreJapanese,
+          ignoreAI: settings.ignoreAI,
+        );
+
+        // Client-side Level6 filter 拿最终列表分页
+        final validBooks =
+            settings.ignoreLevel6
+                ? result.books.where((b) => b.level != 6).toList()
+                : result.books;
+
+        _allValidBooks.addAll(validBooks);
+
+        if (_nextBackendPage >= result.totalPages || result.books.isEmpty) {
+          _hasReachedEnd = true;
+          break;
+        } else {
+          _nextBackendPage++;
+        }
+      }
+
+      if (mounted) {
+        setState(() {
+          _currentFrontendPage = page;
+          _loading = false;
+        });
+
+        // 翻页时回到顶部
+        if (_scrollController.hasClients && page != 1) {
+          _scrollController.jumpTo(0);
+        }
+      }
+    } catch (e) {
+      _logger.severe('Search failed: $e');
+      if (mounted) {
+        setState(() {
+          _loading = false;
+        });
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('搜索失败')));
+      }
+    }
+  }
+
+  bool get _canGoNext {
+    if (!_hasReachedEnd) return true;
+    int maxPages = (_allValidBooks.length / _pageSize).ceil();
+    return _currentFrontendPage < maxPages;
+  }
+
+  bool get _shouldShowPagination {
+    return _allValidBooks.length > _pageSize || !_hasReachedEnd;
+  }
+
+  Widget _buildPagination() {
+    final colorScheme = Theme.of(context).colorScheme;
+    final textTheme = Theme.of(context).textTheme;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 24.0, horizontal: 16.0),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          FilledButton.tonalIcon(
+            onPressed:
+                _currentFrontendPage > 1 && !_loading
+                    ? () => _fetchPage(_currentFrontendPage - 1)
+                    : null,
+            icon: const Icon(Icons.navigate_before),
+            label: const Text('上一页'),
+          ),
+          const SizedBox(width: 16),
+          Text(
+            '第 $_currentFrontendPage 页',
+            style: textTheme.titleMedium?.copyWith(
+              fontWeight: FontWeight.bold,
+              color: colorScheme.onSurface,
+            ),
+          ),
+          const SizedBox(width: 16),
+          FilledButton.tonalIcon(
+            onPressed:
+                _canGoNext && !_loading
+                    ? () => _fetchPage(_currentFrontendPage + 1)
+                    : null,
+            icon: const Icon(Icons.navigate_next),
+            label: const Text('下一页'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _onHistoryTap(String keyword) {
+    // 先取消待删除状态
+    if (_pendingDeleteItem != null && _pendingDeleteItem != keyword) {
+      setState(() {
+        _pendingDeleteItem = null;
+      });
+      return;
+    }
+    // 搜索前收起键盘
+    FocusScope.of(context).unfocus();
+    _submitSearch(keyword);
+  }
+
+  void _onHistoryLongPress(String keyword) {
+    setState(() {
+      _pendingDeleteItem = keyword;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final textTheme = Theme.of(context).textTheme;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: TextField(
+          controller: _searchController,
+          focusNode: _focusNode,
+          decoration: InputDecoration(
+            hintText: '搜索书籍...',
+            border: InputBorder.none,
+            contentPadding: const EdgeInsets.symmetric(vertical: 15),
+            suffixIcon: IconButton(
+              icon: const Icon(Icons.search),
+              onPressed: () => _submitSearch(),
+            ),
+          ),
+          textInputAction: TextInputAction.search,
+          onSubmitted: (_) => _submitSearch(),
+        ),
+      ),
+      body:
+          _loading
+              ? const Center(child: M3ELoadingIndicator())
+              : _hasSearched
+              ? _buildSearchResults(colorScheme, textTheme)
+              : _buildHistorySection(colorScheme, textTheme),
+    );
+  }
+
+  Widget _buildHistorySection(ColorScheme colorScheme, TextTheme textTheme) {
+    return GestureDetector(
+      onTap: () {
+        // 点击空白区域取消待删除状态
+        if (_pendingDeleteItem != null) {
+          setState(() {
+            _pendingDeleteItem = null;
+          });
+        }
+      },
+      behavior: HitTestBehavior.translucent,
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // 头部
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  '搜索历史',
+                  style: textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                if (_history.isNotEmpty)
+                  TextButton.icon(
+                    onPressed: _clearHistory,
+                    icon: const Icon(Icons.delete_outline, size: 18),
+                    label: const Text('清空'),
+                    style: TextButton.styleFrom(
+                      foregroundColor: colorScheme.error,
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 12),
+
+            // 历史记录标签
+            if (_history.isEmpty)
+              Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(32),
+                  child: Text(
+                    '暂无搜索记录',
+                    style: textTheme.bodyLarge?.copyWith(
+                      color: colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+              )
+            else
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children:
+                    _history.map((keyword) {
+                      final isPendingDelete = _pendingDeleteItem == keyword;
+                      return GestureDetector(
+                        onTap: () {
+                          if (isPendingDelete) {
+                            _removeFromHistory(keyword);
+                          } else {
+                            _onHistoryTap(keyword);
+                          }
+                        },
+                        onLongPress: () => _onHistoryLongPress(keyword),
+                        child: Chip(
+                          label: Text(
+                            isPendingDelete ? '删除?' : keyword,
+                            style: TextStyle(
+                              color:
+                                  isPendingDelete
+                                      ? colorScheme.error
+                                      : colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                          backgroundColor:
+                              isPendingDelete
+                                  ? colorScheme.errorContainer
+                                  : colorScheme.surfaceContainerHighest,
+                          side: BorderSide.none,
+                        ),
+                      );
+                    }).toList(),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSearchResults(ColorScheme colorScheme, TextTheme textTheme) {
+    if (_allValidBooks.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.search_off,
+              size: 64,
+              color: colorScheme.onSurfaceVariant,
+            ),
+            const SizedBox(height: 16),
+            Text(
+              '没有找到相关书籍',
+              style: textTheme.bodyLarge?.copyWith(
+                color: colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    final startIndex = (_currentFrontendPage - 1) * _pageSize;
+    final endIndex = math.min(startIndex + _pageSize, _allValidBooks.length);
+    final displayBooks =
+        startIndex < _allValidBooks.length
+            ? _allValidBooks.sublist(startIndex, endIndex)
+            : <Book>[];
+
+    return CustomScrollView(
+      controller: _scrollController,
+      slivers: [
+        SliverPadding(
+          padding: const EdgeInsets.all(12),
+          sliver: SliverGrid(
+            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: 3,
+              childAspectRatio: 0.58,
+              crossAxisSpacing: 10,
+              mainAxisSpacing: 12,
+            ),
+            delegate: SliverChildBuilderDelegate((context, index) {
+              return _buildBookCard(context, displayBooks[index]);
+            }, childCount: displayBooks.length),
+          ),
+        ),
+        if (_shouldShowPagination)
+          SliverToBoxAdapter(child: _buildPagination()),
+        SliverToBoxAdapter(
+          child: SizedBox(height: MediaQuery.paddingOf(context).bottom),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildBookCard(BuildContext context, Book book) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final textTheme = Theme.of(context).textTheme;
+    final heroTag = 'search_cover_${book.id}';
+
+    return GestureDetector(
+      onTap: () {
+        Navigator.of(context).push(
+          MaterialPageRoute(
+            builder:
+                (_) => BookDetailPage(
+                  bookId: book.id,
+                  initialCoverUrl: book.cover,
+                  initialTitle: book.title,
+                  heroTag: heroTag,
+                ),
+          ),
+        );
+      },
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Expanded(
+            child: Hero(
+              tag: heroTag,
+              child: Stack(
+                children: [
+                  Card(
+                    elevation: 2,
+                    shadowColor: colorScheme.shadow.withValues(alpha: 0.3),
+                    clipBehavior: Clip.antiAlias,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: BookCoverPreviewer(
+                      coverUrl: book.cover,
+                      child: BookCoverImage(
+                        imageUrl: book.cover,
+                        width: double.infinity,
+                        height: double.infinity,
+                      ),
+                    ),
+                  ),
+                  // 书籍类型角标（Hero 内部）
+                  if (ref
+                      .watch(settingsProvider)
+                      .isBookTypeBadgeEnabled('search'))
+                    BookTypeBadge(category: book.category),
+                ],
+              ),
+            ),
+          ),
+          SizedBox(
+            height: 36, // 固定高度容纳两行文字
+            child: Padding(
+              padding: const EdgeInsets.only(top: 6, left: 2, right: 2),
+              child: Text(
+                book.title,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: textTheme.bodySmall?.copyWith(
+                  color: colorScheme.onSurface,
+                  height: 1.2,
+                ),
+                textAlign: TextAlign.center,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}

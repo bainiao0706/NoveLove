@@ -1,0 +1,96 @@
+name: Build Unsigned IPA
+
+on:
+  workflow_dispatch: # 手动触发
+  push:
+    branches: ["main", "master"]
+    paths:
+      - 'lib/**'
+      - 'ios/**'
+      - 'rust/**'
+      - 'pubspec.yaml'
+      - '.github/workflows/build_ios_ipa.yml'
+
+jobs:
+  build-ipa:
+    name: Build iOS IPA
+    runs-on: macos-15
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set Commit SHA
+        run: echo "COMMIT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      # 指定 Xcode 26
+      - name: Select Xcode 26
+        run: sudo xcode-select -s /Applications/Xcode_26.2.app/Contents/Developer
+
+      # 配置 Flutter
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'master'
+          cache: true
+
+      # 预缓存 iOS 引擎工件
+      - name: Precache Flutter iOS Artifacts
+        run: flutter precache --ios
+
+      # 获取依赖
+      - name: Flutter Pub Get
+        run: flutter pub get
+
+      # 安装 Pods 生成项目文件
+      - name: Install CocoaPods Dependencies
+        run: |
+          cd ios
+          pod install
+          cd ..
+
+      # 移除所有签名配置
+      - name: Nuke Code Signing
+        run: |
+          echo "☢️ Nuking code signing configurations..."
+          
+          # 处理 Runner 项目
+          echo "   -> Patching Runner.xcodeproj..."
+          sed -i '' 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Manual;/g' ios/Runner.xcodeproj/project.pbxproj
+          sed -i '' 's/"CODE_SIGN_IDENTITY\[sdk=iphoneos\*\]" = "iPhone Developer";/"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "";/g' ios/Runner.xcodeproj/project.pbxproj
+          
+          # 处理 Pods 项目
+          echo "   -> Patching Pods.xcodeproj..."
+          # 将 Pods 项目中的所有签名要求强制改为 Manual 和 空
+          sed -i '' 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Manual;/g' ios/Pods/Pods.xcodeproj/project.pbxproj
+          sed -i '' 's/CODE_SIGN_IDENTITY = "iPhone Developer";/CODE_SIGN_IDENTITY = "";/g' ios/Pods/Pods.xcodeproj/project.pbxproj
+          sed -i '' 's/"CODE_SIGN_IDENTITY\[sdk=iphoneos\*\]" = "iPhone Developer";/"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "";/g' ios/Pods/Pods.xcodeproj/project.pbxproj
+
+          # 处理 xcconfig
+          echo "   -> Patching Release.xcconfig..."
+          echo "CODE_SIGNING_ALLOWED = NO" >> ios/Flutter/Release.xcconfig
+          echo "CODE_SIGNING_REQUIRED = NO" >> ios/Flutter/Release.xcconfig
+          echo "CODE_SIGN_IDENTITY =" >> ios/Flutter/Release.xcconfig
+          echo "CODE_SIGN_STYLE = Manual" >> ios/Flutter/Release.xcconfig
+          
+          echo "✅ Code signing configurations nuked for EVERYTHING."
+
+      # 构建免签 Release
+      - name: Build iOS Release (No Codesign)
+        run: flutter build ios --release --no-codesign --verbose --dart-define=COMMIT_ID=$COMMIT_SHA
+
+      # 打包 IPA
+      - name: Package IPA
+        run: |
+          mkdir Payload
+          mv build/ios/iphoneos/Runner.app Payload
+          zip -r novella.ipa Payload
+
+      # 上传产物
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: novella-unsigned-ipa
+          path: novella.ipa

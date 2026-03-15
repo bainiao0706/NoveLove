@@ -1,0 +1,73 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch: # 手动触发
+  push:
+    branches: ["main", "master"]
+    paths:
+      - 'lib/**'
+      - 'android/**'
+      - 'rust/**'
+      - 'pubspec.yaml'
+      - '.github/workflows/build_android_apk.yml'
+
+jobs:
+  build-apk:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set Commit SHA
+        run: echo "COMMIT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      # 配置 Java 环境
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      # 配置 Flutter
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'master'
+          cache: true
+
+      # 获取依赖
+      - name: Flutter Pub Get
+        run: flutter pub get
+
+      # 还原 Release Keystore
+      - name: Decode Keystore
+        env:
+          ENCODED_STRING: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          printf '%s' "$ENCODED_STRING" | base64 --decode > android/app/release.keystore
+
+      # 构建 APK
+      - name: Build Android APK
+        env:
+          KEYSTORE_FILE: release.keystore
+          KEYSTORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: flutter build apk --release --verbose --dart-define=COMMIT_ID=$COMMIT_SHA
+
+      # 重命名 APK
+      - name: Rename APK
+        run: |
+          cp build/app/outputs/flutter-apk/app-release.apk novella.apk
+
+      # 上传产物
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: novella-android-apk
+          path: novella.apk

@@ -61,7 +61,7 @@ dependencies:
   package_info_plus: ^8.3.0
   flutter_inappwebview: ^6.2.0-beta.3
   cloudflare_turnstile: ^3.6.2
-  webdav_client: ^2.1.0
+  webdav_client: ^1.2.2
   dynamic_color: ^1.8.1
   flutter_colorpicker: ^1.1.0
   soft_edge_blur: ^0.1.3
